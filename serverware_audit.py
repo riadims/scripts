@@ -1,226 +1,195 @@
 #!/usr/bin/env python3
 """
-SERVERware LXC Nginx Cluster Audit Tool
-Probes SSH keys prior to requesting passwords, dynamically discovers
-running VPS instances, and extracts Nginx build versions concurrently.
+Controller-Native SERVERware Fleet Nginx Audit Tool
+Connects directly to Storage Hosts via root@<HOST_IP>:4400 using SSH key trust.
+Uses 'lxc-attach' with an in-container shell fallback to inspect PBXware chroots
+and standard Ubuntu VPS instances seamlessly without password prompts.
 """
 
 import concurrent.futures
 import csv
-import getpass
-import os
 import re
-import shutil
 import subprocess
-import sys
 
-print("=== SERVERware Cluster Nginx Audit ===")
+OUTPUT_CSV = "nginx_fleet_audit.csv"
+DB_NAME = "serverware"
+HOST_SSH_PORT = "4400"
+HOST_USER = "root"
 
-# 1. Configuration & Prompts
-cluster_name = input("Enter Cluster Name: ").strip() or "Cluster-1"
-host_ip = input("Enter Host IP: ").strip()
-ssh_port = input("Enter SSH Port [22]: ").strip() or "22"
-ssh_user = input("Enter SSH User: ").strip() or "root"
 
-use_ssh_keys = False
-use_sudo_nopasswd = False
-ssh_pass = ""
-root_pass = ""
+def get_host_ip_column():
+  """Inspects sw_hosts schema to find the active host IP column name."""
+  cmd = ["mysql", DB_NAME, "-N", "-B", "-e", "DESCRIBE sw_hosts;"]
+  try:
+    res = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    if res.returncode == 0:
+      columns = [
+          line.split("\t")[0].strip()
+          for line in res.stdout.strip().split("\n")
+          if line.strip()
+      ]
+      for candidate in [
+          "ip_address",
+          "ip",
+          "mgmt_ip",
+          "management_ip",
+          "host_ip",
+          "address",
+      ]:
+        if candidate in columns:
+          return candidate
+  except Exception:
+    pass
+  return "ip_address"
 
-# 2. Probe SSH Key Access First
-print(f"\n[+] Probing SSH key access for {ssh_user}@{host_ip}:{ssh_port}...")
-key_check = subprocess.run(
-    [
-        "ssh",
-        "-p",
-        ssh_port,
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=3",
-        f"{ssh_user}@{host_ip}",
-        "echo auth_ok",
-    ],
-    capture_output=True,
-    text=True,
-)
 
-if key_check.returncode == 0 and "auth_ok" in key_check.stdout:
-    print("  [✓] SSH Key authentication successful.")
-    use_ssh_keys = True
+def get_vps_host_mappings():
+  """Queries local MySQL database to map active VPS instances to Storage Host IPs."""
+  host_ip_col = get_host_ip_column()
+  query = f"""
+    SELECT v.name, i.address, h.{host_ip_col}
+    FROM sw_vpses v
+    JOIN sw_vps_interfaces i ON v.id = i.vps_id
+    JOIN sw_hosts h ON v.host_id = h.id
+    WHERE v.state = 'RUNNING' 
+      AND i.address IS NOT NULL 
+      AND i.address != '';
+    """
+  cmd = ["mysql", DB_NAME, "-N", "-B", "-e", query]
+  try:
+    res = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    if res.returncode != 0:
+      print(f"[-] Database Error: {res.stderr.strip()}")
+      return []
 
-    # Check for passwordless sudo
-    sudo_check = subprocess.run(
-        [
-            "ssh",
-            "-p",
-            ssh_port,
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            f"{ssh_user}@{host_ip}",
-            "sudo -n true",
-        ],
-        capture_output=True,
-        text=True,
+    vps_list = []
+    for line in res.stdout.strip().split("\n"):
+      if not line.strip():
+        continue
+      parts = line.split("\t")
+      if len(parts) >= 3:
+        vps_name, vps_ip, host_ip = (
+            parts[0].strip(),
+            parts[1].strip(),
+            parts[2].strip(),
+        )
+        vps_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", vps_ip)
+        host_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", host_ip)
+        if vps_match and host_match:
+          vps_list.append((vps_name, vps_match.group(0), host_match.group(0)))
+    return vps_list
+  except FileNotFoundError:
+    print("[-] Error: 'mysql' command not found on Controller.")
+    return []
+
+
+def inspect_vps_via_host(vps_data):
+  """SSHs into Storage Host on port 4400 as root and executes in-container fallback logic."""
+  vps_name, vps_ip, host_ip = vps_data
+
+  # In-container shell wrapper:
+  # 1. Checks PBXware chroot binary first
+  # 2. Checks PBXware wrapper script second
+  # 3. Checks standard system Nginx binary for Ubuntu VPS instances
+  in_container_shell = (
+      "/bin/sh -c '"
+      "if [ -f /opt/pbxware/pw/usr/sbin/nginx ]; then "
+      "  chroot /opt/pbxware/pw /usr/sbin/nginx -v; "
+      "elif [ -f /opt/pbxware/sh/nginx ]; then "
+      "  /opt/pbxware/sh/nginx -v; "
+      "elif command -v nginx >/dev/null 2>&1; then "
+      "  nginx -v; "
+      "elif [ -f /usr/sbin/nginx ]; then "
+      "  /usr/sbin/nginx -v; "
+      "else "
+      '  echo "Nginx Not Found"; '
+      "fi'"
+  )
+
+  ssh_cmd = [
+      "ssh",
+      "-p",
+      HOST_SSH_PORT,
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "StrictHostKeyChecking=no",
+      "-o",
+      "ConnectTimeout=5",
+      f"{HOST_USER}@{host_ip}",
+      f"lxc-attach -n {vps_name} -- {in_container_shell}",
+  ]
+
+  try:
+    res = subprocess.run(
+        ssh_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=8,
     )
 
-    if sudo_check.returncode == 0:
-        print("  [✓] Passwordless sudo detected.")
-        use_sudo_nopasswd = True
-    else:
-        print("  [!] Sudo requires elevation.")
-        root_pass = getpass.getpass("Enter Root/Sudo Password: ")
-else:
-    print("  [!] SSH Key unavailable. Falling back to password auth.")
+    output = res.stderr if res.stderr else res.stdout
+    match = re.search(r"nginx/([\d.]+)", output, re.IGNORECASE)
 
-    if not shutil.which("sshpass"):
-        print(
-            "\n[X] Error: 'sshpass' is required when SSH key authentication is missing."
-        )
-        print("    Install via package manager (e.g., sudo apt install sshpass)")
-        sys.exit(1)
-
-    ssh_pass = getpass.getpass("Enter SSH Password: ")
-    root_pass = getpass.getpass("Enter Root/Sudo Password: ")
-
-
-def run_host_ssh(remote_cmd):
-    """Executes host commands via SSH using the active authentication mode."""
-    env = os.environ.copy()
-
-    if use_ssh_keys:
-        if use_sudo_nopasswd:
-            cmd = [
-                "ssh",
-                "-p",
-                ssh_port,
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "ConnectTimeout=5",
-                f"{ssh_user}@{host_ip}",
-                f"sudo {remote_cmd}",
-            ]
-            res = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15
-            )
-        else:
-            cmd = [
-                "ssh",
-                "-p",
-                ssh_port,
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "ConnectTimeout=5",
-                f"{ssh_user}@{host_ip}",
-                f"sudo -S -p '' {remote_cmd}",
-            ]
-            res = subprocess.run(
-                cmd,
-                input=f"{root_pass}\n",
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-    else:
-        env["SSHPASS"] = ssh_pass
-        cmd = [
-            "sshpass",
-            "-e",
-            "ssh",
-            "-p",
-            ssh_port,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=5",
-            f"{ssh_user}@{host_ip}",
-            f"sudo -S -p '' {remote_cmd}",
-        ]
-        res = subprocess.run(
-            cmd,
-            input=f"{root_pass}\n",
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=15,
-        )
-
-    return res.stdout.strip(), res.stderr.strip()
-
-
-def discover_serverware_vps():
-    """Discovers all active LXC containers and IP assignments on the host."""
-    print(f"\n[+] Discovering VPS instances on {host_ip}...")
-    stdout, stderr = run_host_ssh("lxc-ls -f")
-
-    containers = []
-    if stdout:
-        for line in stdout.splitlines():
-            if "RUNNING" in line:
-                parts = line.split()
-                vps_name = parts[0]
-                ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", line)
-                vps_ip = ip_match.group(0) if ip_match else "Unknown IP"
-                containers.append((vps_name, vps_ip))
-    elif stderr:
-        print(f"[-] Error querying host: {stderr}")
-
-    return containers
-
-
-def check_nginx(vps):
-    """Fetches Nginx version directly inside the guest LXC container."""
-    vps_name, vps_ip = vps
-    stdout, stderr = run_host_ssh(
-        f"lxc-attach -n {vps_name} -- /opt/pbxware/sh/nginx -v"
-    )
-
-    output = stderr if stderr else stdout
-    nginx_ver = "Unknown Error"
-
-    match = re.search(r"nginx/([\d.]+)", output)
     if match:
-        nginx_ver = match.group(1)
-    elif "not found" in output.lower():
-        nginx_ver = "Not Installed"
-    else:
-        nginx_ver = "Execution Failed"
+      version = match.group(1)
+      print(f" -> [{vps_name}] ({vps_ip}) on Host [{host_ip}]: Nginx {version}")
+      return [vps_name, vps_ip, host_ip, version, "Host LXC Attach"]
+    elif "Nginx Not Found" in output:
+      print(f" -> [{vps_name}] ({vps_ip}) on Host [{host_ip}]: Non-Nginx VPS")
+      return [vps_name, vps_ip, host_ip, "Not Installed", "Host LXC Attach"]
+  except Exception:
+    pass
 
-    print(f" -> [{vps_name}] ({vps_ip}): Nginx {nginx_ver}")
-    return [cluster_name, host_ip, vps_name, vps_ip, nginx_ver]
+  print(
+      f" -> [{vps_name}] ({vps_ip}) on Host [{host_ip}]: Connection or"
+      " Execution Error"
+  )
+  return [vps_name, vps_ip, host_ip, "Execution Failed", "Failed"]
 
 
 def main():
-    vps_list = discover_serverware_vps()
-    if not vps_list:
-        print("[-] No running VPS instances found. Verification aborted.")
-        return
+  print("=== Controller Centralized Fleet Nginx Audit ===")
+  vps_list = get_vps_host_mappings()
+  if not vps_list:
+    print("[-] No running VPS instances mapped to hosts.")
+    return
 
-    print(
-        f"[+] Found {len(vps_list)} running instances. Scanning in parallel..."
+  print(
+      f"[+] Mapped {len(vps_list)} active VPS instances. Connecting to Hosts"
+      f" via {HOST_USER}@{HOST_SSH_PORT}..."
+  )
+
+  all_results = []
+  with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
+    futures = [
+        executor.submit(inspect_vps_via_host, vps) for vps in vps_list
+    ]
+    for future in concurrent.futures.as_completed(futures):
+      res = future.result()
+      if res:
+        all_results.append(res)
+
+  with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(
+        ["VPS Name", "VPS IP", "Host IP", "Nginx Version", "Detection Method"]
     )
+    writer.writerows(all_results)
 
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-        results = list(executor.map(check_nginx, vps_list))
-
-    output_file = "nginx_cluster_audit.csv"
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            ["Cluster", "Host IP", "VPS Name", "VPS IP", "Nginx Version"]
-        )
-        writer.writerows(results)
-
-    print(f"\n[+] Audit complete! Report generated at '{output_file}'.")
+  print(f"\n[+] Audit complete! Report saved to '{OUTPUT_CSV}'.")
 
 
 if __name__ == "__main__":
-    main()
-
+  main()
