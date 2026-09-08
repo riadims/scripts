@@ -1,0 +1,122 @@
+#!/bin/bash
+# ==============================================================================
+# Location-Aware PBXware Version Audit Tool (Non-Interactive / Key-Auth Only)
+# Assumptions: SSH key authentication is pre-configured.
+# Usage: ./check_pbxware.sh [TARGET_IP] [PORT]
+# ==============================================================================
+
+MAX_HOPS=2
+CURRENT_HOP=1
+TARGET_IP=""
+TARGET_PORT="22"
+
+# Handle positional parameters for both direct run and recursive SSH hops
+if [[ "$1" =~ ^[0-9]+$ ]]; then
+    CURRENT_HOP="$1"
+    TARGET_IP="${2:-}"
+    TARGET_PORT="${3:-22}"
+else
+    TARGET_IP="${1:-}"
+    TARGET_PORT="${2:-22}"
+fi
+
+print_header() {
+    echo "VPS NAME | VPS IP | PBXware Full Version | PBXware Main Version"
+    echo "-----------------------------------------------------------------"
+}
+
+# Auto-detects the version column in sw_vpses for database schema compatibility
+detect_version_column() {
+    local exec_prefix="$1"
+    local desc_cmd="${exec_prefix} mysql serverware -N -B -e 'DESCRIBE sw_vpses;' 2>/dev/null"
+    local cols
+    cols=$(eval "$desc_cmd" | awk '{print $1}')
+
+    for candidate in version app_version pbxware_version release; do
+        if echo "$cols" | grep -qx "$candidate"; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo "version"
+}
+
+# Executes database query and prints formatted report
+run_db_audit() {
+    local exec_prefix="$1"  # Empty for Controller, 'lxc-attach -n CONTROLLER --' for Storage Host
+    local ver_col
+    ver_col=$(detect_version_column "$exec_prefix")
+
+    local sql_query="SELECT v.name, i.address, COALESCE(v.${ver_col}, 'N/A') FROM sw_vpses v JOIN sw_vps_interfaces i ON v.id = i.vps_id WHERE v.state = 'RUNNING' AND i.address IS NOT NULL AND i.address != '';"
+
+    print_header
+
+    eval "${exec_prefix} mysql serverware -N -B -e \"${sql_query}\" 2>/dev/null" | while read -r v_name v_ip full_v; do
+        if [ -n "$full_v" ] && [ "$full_v" != "N/A" ] && [ "$full_v" != "NULL" ]; then
+            main_v=$(echo "$full_v" | grep -oP "^\d+" || echo "$full_v" | cut -d'.' -f1)
+        else
+            full_v="Not PBXware / Unknown"
+            main_v="N/A"
+        fi
+        echo "$v_name | $v_ip | $full_v | $main_v"
+    done
+}
+
+# ------------------------------------------------------------------------------
+# ENVIRONMENT DETECTION & NON-INTERACTIVE ROUTING
+# ------------------------------------------------------------------------------
+
+# 1. Direct Controller Context (Local MySQL Access)
+if mysql -e "USE serverware;" &>/dev/null; then
+    echo "[+] Context: SERVERware Controller Node" >&2
+    run_db_audit ""
+    exit 0
+
+# 2. Storage Host Context
+elif command -v sysmonit &>/dev/null || command -v lxc-info &>/dev/null; then
+
+    # 2a. Active CONTROLLER Container is running locally on this host
+    if lxc-info -n CONTROLLER -s 2>/dev/null | grep -q "RUNNING"; then
+        echo "[+] Context: Storage Host (Active CONTROLLER Container)" >&2
+        run_db_audit "lxc-attach -n CONTROLLER --"
+        exit 0
+
+    # 2b. Standby Host (CONTROLLER container running on peer host)
+    else
+        echo "[!] Context: Storage Host (Routing to Peer Storage Host...)" >&2
+        if [ "$CURRENT_HOP" -ge "$MAX_HOPS" ]; then
+            echo "[-] Error: Maximum hop limit reached ($MAX_HOPS)." >&2
+            exit 1
+        fi
+
+        PEER_IP=$(grep -iE "primary|secondary" /etc/hosts 2>/dev/null | grep -v "127.0.0.1" | awk '{print $1}' | head -n1)
+        if [ -z "$PEER_IP" ]; then
+            echo "[-] Error: Could not auto-detect peer Storage Host IP in /etc/hosts." >&2
+            exit 1
+        fi
+
+        NEXT_HOP=$((CURRENT_HOP + 1))
+        ssh -p "$TARGET_PORT" -o BatchMode=yes -o StrictHostKeyChecking=no "root@$PEER_IP" "bash -s -- $NEXT_HOP $PEER_IP $TARGET_PORT" < "$0"
+        exit 0
+    fi
+
+# 3. External Workstation Context (Non-SERVERware Machine)
+else
+    if [ "$CURRENT_HOP" -ge "$MAX_HOPS" ]; then
+        echo "[-] Error: Maximum hop limit reached ($MAX_HOPS)." >&2
+        exit 1
+    fi
+
+    if [ -z "$TARGET_IP" ]; then
+        echo "[-] Error: No target IP provided." >&2
+        echo "    Usage: $0 <TARGET_IP> [PORT]" >&2
+        exit 1
+    fi
+
+    echo "[!] Context: External Workstation (Connecting to $TARGET_IP:$TARGET_PORT via SSH keys)..." >&2
+    NEXT_HOP=$((CURRENT_HOP + 1))
+
+    # Passes script self-contents over SSH non-interactively using pre-configured SSH keys
+    ssh -p "$TARGET_PORT" -o BatchMode=yes -o StrictHostKeyChecking=no "root@$TARGET_IP" "bash -s -- $NEXT_HOP $TARGET_IP $TARGET_PORT" < "$0"
+    exit 0
+fi
