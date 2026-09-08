@@ -2,8 +2,7 @@
 """
 Controller-Native SERVERware Fleet Nginx Audit Tool
 Connects directly to Storage Hosts via root@<HOST_IP>:4400 using SSH key trust.
-Uses 'lxc-attach' with an in-container shell fallback to inspect PBXware chroots
-and standard Ubuntu VPS instances seamlessly without password prompts.
+Formats output as: Host Name/Cluster | Host IP | VPS Name | VPS IP | Nginx Version
 """
 
 import concurrent.futures
@@ -49,10 +48,12 @@ def get_host_ip_column():
 
 
 def get_vps_host_mappings():
-  """Queries local MySQL database to map active VPS instances to Storage Host IPs."""
+  """Queries local MySQL database to map active VPS instances to Storage Hosts."""
   host_ip_col = get_host_ip_column()
+
+  # Selects Host Name, Host IP, VPS Name, VPS IP
   query = f"""
-    SELECT v.name, i.address, h.{host_ip_col}
+    SELECT h.name, h.{host_ip_col}, v.name, i.address
     FROM sw_vpses v
     JOIN sw_vps_interfaces i ON v.id = i.vps_id
     JOIN sw_hosts h ON v.host_id = h.id
@@ -77,16 +78,19 @@ def get_vps_host_mappings():
       if not line.strip():
         continue
       parts = line.split("\t")
-      if len(parts) >= 3:
-        vps_name, vps_ip, host_ip = (
-            parts[0].strip(),
-            parts[1].strip(),
-            parts[2].strip(),
-        )
-        vps_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", vps_ip)
+      if len(parts) >= 4:
+        host_name = parts[0].strip()
+        host_ip = parts[1].strip()
+        vps_name = parts[2].strip()
+        vps_ip = parts[3].strip()
+
         host_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", host_ip)
-        if vps_match and host_match:
-          vps_list.append((vps_name, vps_match.group(0), host_match.group(0)))
+        vps_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", vps_ip)
+
+        if host_match and vps_match:
+          vps_list.append(
+              (host_name, host_match.group(0), vps_name, vps_match.group(0))
+          )
     return vps_list
   except FileNotFoundError:
     print("[-] Error: 'mysql' command not found on Controller.")
@@ -95,7 +99,7 @@ def get_vps_host_mappings():
 
 def inspect_vps_via_host(vps_data):
   """SSHs into Storage Host on port 4400 as root and executes in-container fallback logic."""
-  vps_name, vps_ip, host_ip = vps_data
+  host_name, host_ip, vps_name, vps_ip = vps_data
 
   # In-container shell wrapper:
   # 1. Checks PBXware chroot binary first
@@ -130,6 +134,7 @@ def inspect_vps_via_host(vps_data):
       f"lxc-attach -n {vps_name} -- {in_container_shell}",
   ]
 
+  version = "Execution Failed"
   try:
     res = subprocess.run(
         ssh_cmd,
@@ -144,19 +149,14 @@ def inspect_vps_via_host(vps_data):
 
     if match:
       version = match.group(1)
-      print(f" -> [{vps_name}] ({vps_ip}) on Host [{host_ip}]: Nginx {version}")
-      return [vps_name, vps_ip, host_ip, version, "Host LXC Attach"]
     elif "Nginx Not Found" in output:
-      print(f" -> [{vps_name}] ({vps_ip}) on Host [{host_ip}]: Non-Nginx VPS")
-      return [vps_name, vps_ip, host_ip, "Not Installed", "Host LXC Attach"]
+      version = "Not Installed"
   except Exception:
     pass
 
-  print(
-      f" -> [{vps_name}] ({vps_ip}) on Host [{host_ip}]: Connection or"
-      " Execution Error"
-  )
-  return [vps_name, vps_ip, host_ip, "Execution Failed", "Failed"]
+  # Output directly in requested format: Host Name/Cluster | Host IP | VPS Name | VPS IP | Nginx Version
+  print(f" -> {host_name} | {host_ip} | {vps_name} | {vps_ip} | Nginx {version}")
+  return [host_name, host_ip, vps_name, vps_ip, version]
 
 
 def main():
@@ -167,9 +167,11 @@ def main():
     return
 
   print(
-      f"[+] Mapped {len(vps_list)} active VPS instances. Connecting to Hosts"
-      f" via {HOST_USER}@{HOST_SSH_PORT}..."
+      f"[+] Mapped {len(vps_list)} active VPS instances. Connecting via"
+      f" {HOST_USER}@{HOST_SSH_PORT}...\n"
   )
+  print("Host Name/Cluster | Host IP | VPS Name | VPS IP | Nginx Version")
+  print("-" * 75)
 
   all_results = []
   with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
@@ -184,7 +186,7 @@ def main():
   with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
     writer = csv.writer(f)
     writer.writerow(
-        ["VPS Name", "VPS IP", "Host IP", "Nginx Version", "Detection Method"]
+        ["Host Name/Cluster", "Host IP", "VPS Name", "VPS IP", "Nginx Version"]
     )
     writer.writerows(all_results)
 
