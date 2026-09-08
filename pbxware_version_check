@@ -9,6 +9,10 @@ MAX_HOPS=2
 CURRENT_HOP=1
 TARGET_IP=""
 TARGET_PORT="22"
+OUTPUT_CSV="pbxware_fleet_audit.csv"
+
+# Common SSH options including legacy RSA host key support for Port 4400
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o ConnectTimeout=5"
 
 # Handle positional parameters for both direct run and recursive SSH hops
 if [[ "$1" =~ ^[0-9]+$ ]]; then
@@ -41,7 +45,7 @@ detect_version_column() {
     echo "version"
 }
 
-# Executes database query and prints formatted report
+# Executes database query, prints formatted report, and writes to CSV
 run_db_audit() {
     local exec_prefix="$1"  # Empty for Controller, 'lxc-attach -n CONTROLLER --' for Storage Host
     local ver_col
@@ -50,6 +54,7 @@ run_db_audit() {
     local sql_query="SELECT v.name, i.address, COALESCE(v.${ver_col}, 'N/A') FROM sw_vpses v JOIN sw_vps_interfaces i ON v.id = i.vps_id WHERE v.state = 'RUNNING' AND i.address IS NOT NULL AND i.address != '';"
 
     print_header
+    echo "VPS Name,VPS IP,PBXware Full Version,PBXware Main Version" > "$OUTPUT_CSV"
 
     eval "${exec_prefix} mysql serverware -N -B -e \"${sql_query}\" 2>/dev/null" | while read -r v_name v_ip full_v; do
         if [ -n "$full_v" ] && [ "$full_v" != "N/A" ] && [ "$full_v" != "NULL" ]; then
@@ -58,8 +63,13 @@ run_db_audit() {
             full_v="Not PBXware / Unknown"
             main_v="N/A"
         fi
+        # Terminal Output
         echo "$v_name | $v_ip | $full_v | $main_v"
+        # CSV File Output
+        echo "\"$v_name\",\"$v_ip\",\"$full_v\",\"$main_v\"" >> "$OUTPUT_CSV"
     done
+
+    echo -e "\n[+] Audit complete! Report saved to '$OUTPUT_CSV'" >&2
 }
 
 # ------------------------------------------------------------------------------
@@ -96,7 +106,7 @@ elif command -v sysmonit &>/dev/null || command -v lxc-info &>/dev/null; then
         fi
 
         NEXT_HOP=$((CURRENT_HOP + 1))
-        ssh -p "$TARGET_PORT" -o BatchMode=yes -o StrictHostKeyChecking=no "root@$PEER_IP" "bash -s -- $NEXT_HOP $PEER_IP $TARGET_PORT" < "$0"
+        ssh -p "$TARGET_PORT" $SSH_OPTS "root@$PEER_IP" "bash -s -- $NEXT_HOP $PEER_IP $TARGET_PORT" < "$0"
         exit 0
     fi
 
@@ -116,7 +126,22 @@ else
     echo "[!] Context: External Workstation (Connecting to $TARGET_IP:$TARGET_PORT via SSH keys)..." >&2
     NEXT_HOP=$((CURRENT_HOP + 1))
 
-    # Passes script self-contents over SSH non-interactively using pre-configured SSH keys
-    ssh -p "$TARGET_PORT" -o BatchMode=yes -o StrictHostKeyChecking=no "root@$TARGET_IP" "bash -s -- $NEXT_HOP $TARGET_IP $TARGET_PORT" < "$0"
+    # Initialize local CSV file on workstation
+    echo "VPS Name,VPS IP,PBXware Full Version,PBXware Main Version" > "$OUTPUT_CSV"
+
+    # Streams remote stdout to terminal while saving clean rows to local CSV file
+    ssh -p "$TARGET_PORT" $SSH_OPTS "root@$TARGET_IP" "bash -s -- $NEXT_HOP $TARGET_IP $TARGET_PORT" < "$0" | while IFS= read -r line; do
+        echo "$line"
+        if [[ "$line" == *"|"* && "$line" != *"VPS NAME"* && "$line" != *"---"* ]]; then
+            IFS='|' read -r c1 c2 c3 c4 <<< "$line"
+            c1=$(echo "$c1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            c2=$(echo "$c2" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            c3=$(echo "$c3" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            c4=$(echo "$c4" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            echo "\"$c1\",\"$c2\",\"$c3\",\"$c4\"" >> "$OUTPUT_CSV"
+        fi
+    done
+
+    echo -e "\n[+] Audit complete! Report saved locally to '$OUTPUT_CSV'" >&2
     exit 0
 fi
